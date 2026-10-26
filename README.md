@@ -4,6 +4,42 @@ Proyecto personal: un portal de retiros donde un cliente pide un
 retiro, el sistema evalúa el riesgo de forma asíncrona, un operador autoriza o rechaza los que necesitan
 revisión manual, y la plata se transfiere a través de un servicio de banco externo (mockeado).
 
+## Qué resuelve
+
+Mover plata trae siempre los mismos problemas: servicios externos lentos o que fallan, procesos en paralelo
+que pueden pisarse y reintentos que pueden pagar dos veces. El proyecto se armó alrededor de seis criterios
+de aceptación; cada uno tiene su mecanismo y un test automático que lo verifica.
+
+| # | Criterio | Cómo se resuelve | Test |
+| --- | --- | --- | --- |
+| **C1** | La llamada lenta al banco no bloquea al operador | Un poller ejecuta la transferencia fuera del request | `TransferExecutionPollerTest` |
+| **C2** | El riesgo se evalúa una sola vez, de forma asíncrona | Poller propio; si el servicio de riesgo falla, va a revisión humana (fail-safe) | `RiskEvaluationPollerTest` |
+| **C3** | Con 2+ instancias, ningún retiro se procesa dos veces | `SELECT ... FOR UPDATE SKIP LOCKED`: la tabla funciona como cola, sin coordinador externo | Tests de concurrencia de los tres pollers |
+| **C4** | Si dos operadores actúan a la vez, gana uno y el otro se entera | Chequeo de estado + `@Version` → `409` con el estado real y quién lo cambió | `WithdrawalServiceAuthorizationTest` |
+| **C5** | Nunca se retira más que el saldo disponible | Un único `UPDATE` condicional atómico | `AccountReservationConcurrencyTest` (20 hilos) |
+| **C6** | Un retiro nunca genera dos transferencias | Idempotency key por retiro + reconciliación que **consulta** al banco en vez de reintentar a ciegas | `ReconciliationPollerTest` |
+
+El porqué de cada decisión, con las alternativas descartadas, está en [`DECISIONS.md`](DECISIONS.md).
+
+## Probalo en dos minutos
+
+1. `docker compose up -d --build` (necesita Docker Desktop).
+2. Abrí `http://localhost:5173` y completá un ID de operador (cualquier texto, por ejemplo `ana`).
+3. Creá retiros con montos cuyos dos últimos decimales fuerzan cada caso: `.96` riesgo bajo (llega solo
+   a `EXECUTED`), `.99` riesgo alto (pide autorización), `.14` el banco no responde y la reconciliación lo
+   resuelve sola. La tabla completa está en [Forzar desenlaces de los mocks](#forzar-desenlaces-de-los-mocks).
+4. Para ver a las dos instancias repartirse el trabajo: `docker compose logs -f backend-1 backend-2`.
+
+## Estructura
+
+```
+backend/    Spring Boot: web (API) · service · poller (riesgo, transferencia, reconciliación)
+            · repository · domain · external/mock (banco y riesgo simulados)
+frontend/   React + TypeScript: backoffice de operadores
+docker-compose.yml   Postgres + dos instancias del backend + frontend
+DECISIONS.md         Decisiones técnicas, alternativas descartadas y uso de IA
+```
+
 ## Stack
 
 | Capa | Tecnología |
@@ -245,7 +281,7 @@ autorizalo a mano si cae en `PENDING_AUTHORIZATION`.
 | `POST` | `/api/withdrawals/{id}/reject` | Requiere el header `X-Operator-Id`. Libera el saldo reservado en la misma transacción. |
 | `POST` | `/api/withdrawals/{id}/retry` | Requiere el header `X-Operator-Id`. Solo válido desde `RETRYABLE_ERROR`; lo devuelve a `AUTHORIZED` para que el poller de transferencia reintente con la misma idempotency key (la reserva nunca se liberó). |
 | `POST` | `/api/withdrawals/{id}/resolve-manual-review` | Requiere el header `X-Operator-Id`. Solo válido desde `MANUAL_REVIEW` (la reconciliación se rindió preguntándole al banco); lo cierra a `FINAL_ERROR` y libera el saldo reservado. |
-| `GET` | `/api/accounts` | Cuentas sembradas con balance y saldo reservado. Comodidad para testing manual y el selector de cuentas de la UI, no es parte del dominio evaluado. |
+| `GET` | `/api/accounts` | Cuentas sembradas con balance y saldo reservado. Comodidad para testing manual y el selector de cuentas de la UI, no es parte del núcleo del dominio. |
 
 Query params de `GET /api/withdrawals`, todos opcionales y combinables:
 
@@ -268,11 +304,11 @@ archivo solo cubre cómo correr el proyecto.
 
 ## Estado del proyecto
 
-En desarrollo activo. El flujo de backend está completo de punta a punta y corre de verdad bajo
+El flujo de backend está completo de punta a punta y corre de verdad bajo
 `docker compose up` con dos instancias: un retiro va desde su creación, pasando por evaluación de riesgo,
 autorización manual cuando hace falta, transferencia bancaria y reconciliación de timeouts ambiguos, hasta
 `EXECUTED` (o un error terminal/reintentable), sin ningún paso manual más allá de las decisiones del
-operador. Construido hasta ahora: modelo de datos y migraciones, mocks de servicios externos (con su verdad
+operador. Incluye: modelo de datos y migraciones, mocks de servicios externos (con su verdad
 de fondo de idempotencia persistida en Postgres, compartida entre instancias — ver `DECISIONS.md` sección
 8), reserva atómica de saldo y creación de retiros, los tres pollers con `SKIP LOCKED` (evaluación de riesgo
 con su fail-safe, ejecución de transferencia con su split claim/call/apply y timeout del lado del cliente,

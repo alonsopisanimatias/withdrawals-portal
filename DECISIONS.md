@@ -75,7 +75,7 @@ C5 sin que nada avise.
 condicionales que Postgres serializa a nivel de fila. Un `@Version` sin usar sería peso muerto
 y además invitaría a mutar la entidad, que es justo lo que se quiere evitar.
 
-**La reserva no es exclusiva de los retiros** (el requerimiento lo pide explícitamente: en el sistema
+**La reserva no es exclusiva de los retiros** (es parte de los requisitos: en el sistema
 real la usarían también otras operaciones, como compra de acciones o de dólares). Por eso
 `tryReserve`/`release`/`settle` (sección 7) están parametrizadas solo por `accountId` y `amount`
 — no reciben ni conocen `withdrawalId` — así que cualquier otra operación que necesite apartar
@@ -125,7 +125,7 @@ reconciliación tiene que resolver contra el banco.
 ### 2.4 `withdrawal_status_history`
 
 Append-only: `(withdrawal_id, previous_status, new_status, actor, occurred_at)`, sin setters,
-todas las columnas `updatable = false`. **No estaba pedida en el requerimiento** — se agregó porque
+todas las columnas `updatable = false`. **No estaba entre los requisitos iniciales** — se agregó porque
 `withdrawal.updated_by` solo dice quién tocó el retiro por última vez, y un broker regulado por
 CNV necesita poder reconstruir la secuencia completa de decisiones sobre un retiro sin depender
 de logs (que rotan y no son transaccionales con el cambio de estado). Costo bajo: un insert por
@@ -380,8 +380,8 @@ darse ese lujo (3-10s + timeout ambiguo) y por eso su diseño exige el split en 
 
 **Alternativas descartadas**:
 
-- *Evaluar en el request*: 1-3s de latencia y 15% de error en el hilo HTTP. Descartado por el
-  requerimiento mismo.
+- *Evaluar en el request*: 1-3s de latencia y 15% de error en el hilo HTTP. Descartado por los
+  propios criterios (C1 y C2).
 - *`@Async` con un executor de Spring*: la cola vive en memoria; si el proceso se reinicia se
   pierden los pendientes, y con 2 instancias no hay ninguna coordinación. Está pensado para
   trabajo disparado por una acción de usuario, no para una cola persistente.
@@ -581,7 +581,7 @@ alto y que un test de concurrencia sobre el invariante crítico no perdona. El j
 **Limitación conocida**: un retiro en `RETRYABLE_ERROR` mantiene su reserva indefinidamente,
 sin TTL. Es una decisión de alcance, no un olvido: liberar reservas por tiempo implica decidir
 qué pasa si el banco confirma la transferencia después de la liberación, y eso es un problema
-de reconciliación mucho más grande que el que el requerimiento plantea. En producción se resolvería
+de reconciliación mucho más grande que el que plantea este proyecto. En producción se resolvería
 con un job de expiración que mueve el retiro a `MANUAL_REVIEW` en vez de liberar plata solo.
 
 **Alternativas descartadas**:
@@ -767,7 +767,7 @@ una respuesta. La exclusión mutua de `executeTransfer` (antes un `Set` en memor
 persiste: la clave primaria de `bank_mock_in_flight` es lo que hace atómico el claim entre
 instancias, vía `INSERT ... ON CONFLICT DO NOTHING`.
 
-*Supuesto explícito*: el requerimiento no dice que el banco ofrezca una consulta por idempotency
+*Supuesto explícito*: los requisitos no dicen que el banco ofrezca una consulta por idempotency
 key. Se asumió porque sin ella un timeout es irresoluble — cualquier decisión (reintentar o
 dar por fallido) sería adivinar, y una de las dos ramas duplica plata. Es el supuesto más
 fuerte del diseño y está declarado como tal en la sección 14.
@@ -838,7 +838,7 @@ vive en el heap de **una sola** instancia, y el evento que dispara la actualizac
 terminando un tick) puede correr en la otra — el mismo problema de estado en memoria por
 instancia que ya se resolvió del lado del banco mock (sección 8). 4 segundos es una elección de
 UX (suficientemente rápido para sentirse "vivo" sin generar carga real: la tabla filtrada trae
-como mucho unas decenas de filas) y no una condición evaluada, así que no tiene test dedicado.
+como mucho unas decenas de filas) y no uno de los criterios C1-C6, así que no tiene test dedicado.
 
 **El 409 de C4 se muestra con lo que realmente pasó, no como error genérico.**
 `useWithdrawalActions.ts` distingue `error.isConflict` y arma el mensaje con
@@ -997,15 +997,15 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
 
 ---
 
-## 14. Supuestos ante ambigüedades del requerimiento
+## 14. Supuestos y decisiones de alcance
 
 - **CBU = exactamente 22 dígitos**, validado en dos capas: `@Pattern(regexp = "^[0-9]{22}$")`
   en `CreateWithdrawalRequest` y `CHECK (destination_cbu ~ '^[0-9]{22}$')` en la tabla. **No**
   se valida el dígito verificador real del CBU: es un algoritmo conocido y trivial de agregar,
   pero no aporta nada a las condiciones que el proyecto tiene que cumplir.
 - **Las cuentas se crean y fondean por seed de Flyway** (`V2__seed_data.sql`), no por un
-  endpoint. El requerimiento no pide administración de cuentas, así que agregar un CRUD sería una
-  feature no pedida. Son tres cuentas, y `ACC-002` está sembrada con 50.000 —cerca de su
+  endpoint. La administración de cuentas queda fuera del alcance, así que agregar un CRUD sería una
+  feature de más. Son tres cuentas, y `ACC-002` está sembrada con 50.000 —cerca de su
   límite— para que un burst de retiros concurrentes choque contra C5 de forma visible en la
   demo.
 - **La identidad del operador es un header `X-Operator-Id`**, confiado tal cual, sin auth (ver
@@ -1013,15 +1013,15 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
   ausencia de autenticación no es excusa para perder la trazabilidad.
 - **Riesgo bajo y medio se autorizan solos; alto va a revisión humana.** Implementado como
   `LOW`/`MEDIUM → AUTHORIZED`, `HIGH → PENDING_AUTHORIZATION`, y **fallo del servicio →
-  `PENDING_AUTHORIZATION`** (el requerimiento pide esto último explícitamente y coincide con el
+  `PENDING_AUTHORIZATION`** (esto último es deliberado y coincide con el
   criterio fail-safe).
 - **Moneda única implícita**: `numeric(18,2)` sin columna de moneda. Multi-moneda cambiaría el
-  modelo de saldos y no está pedido.
+  modelo de saldos y queda fuera del alcance.
 - **El "saldo disponible" de C5 es `balance - reserved_balance`**, es decir, cuentan como
   retiros vivos los que están en evaluación, pendientes de autorización, autorizados y en
   proceso de transferencia. Solo `REJECTED` y los errores terminales devuelven la reserva.
-- **El banco expone una consulta por idempotency key** (`queryByIdempotencyKey`). No está en el
-  requerimiento; es el supuesto más fuerte del diseño y sin él el timeout no tiene solución
+- **El banco expone una consulta por idempotency key** (`queryByIdempotencyKey`). No está en los
+  requisitos; es el supuesto más fuerte del diseño y sin él el timeout no tiene solución
   correcta (ver sección 8).
 - **Convención de forzado por decimales del monto** para poder demostrar cada rama sin tocar
   código ni recompilar: `.96/.97/.99` fuerzan riesgo LOW/MEDIUM/HIGH, `.98` fuerza fallo del
@@ -1045,8 +1045,8 @@ cuentas; ahora afirma que existen las filas sembradas específicas).
   trail tomado del token verificado y no de un header que cualquiera puede escribir —
   en un dominio CNV, una traza que se puede falsificar no es una traza. El costo es acotado
   (un `SecurityFilterChain` y cambiar la fuente del `operatorId`); se dejó afuera porque el
-  requerimiento pide el backoffice, no el control de acceso.
-- **UI de cliente para crear retiros.** Solo se pidió el backoffice de operadores. El endpoint
+  foco del proyecto es el backoffice, no el control de acceso.
+- **UI de cliente para crear retiros.** El alcance es el backoffice de operadores. El endpoint
   `POST /api/withdrawals` existe igual, porque sin él no hay forma de generar carga para
   demostrar C5 y los pollers; se usa por API/curl, que además hace fácil disparar los 20
   concurrentes.
